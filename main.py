@@ -25,6 +25,11 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "wer2go-secret")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL", "")  # Apps Script web app for complaint log
 
+# WhatsApp Cloud API (optional — route stays dormant until these are set)
+WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN", "")
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
@@ -292,6 +297,67 @@ async def ai_reply(chat_id: int, text: str) -> tuple[str, bool, tuple[str, str] 
 
     histories[chat_id].append({"role": "assistant", "content": reply})
     return (reply, False, complaint)
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Cloud API
+# ---------------------------------------------------------------------------
+async def wa_send(to: str, text: str):
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_NUMBER_ID):
+        return
+    url = f"https://graph.facebook.com/v21.0/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, json=payload, headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"})
+        if r.status_code != 200:
+            log.error("WhatsApp send error: %s", r.text)
+
+
+@app.get("/whatsapp")
+async def whatsapp_verify(request: Request):
+    p = request.query_params
+    if p.get("hub.mode") == "subscribe" and WHATSAPP_VERIFY_TOKEN and p.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN:
+        return Response(content=p.get("hub.challenge", ""), media_type="text/plain")
+    return Response(status_code=403)
+
+
+@app.post("/whatsapp")
+async def whatsapp_webhook(request: Request):
+    data = await request.json()
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+    except (KeyError, IndexError, TypeError):
+        return {"ok": True}
+
+    for msg in value.get("messages", []):
+        if msg.get("type") != "text":
+            continue
+        sender = msg["from"]  # phone number, digits only
+        text = msg["text"]["body"].strip()
+
+        reply, should_escalate, complaint = await ai_reply(f"wa:{sender}", text)
+        if complaint:
+            role, category = complaint
+            await log_complaint(role, category, text, {"first_name": f"WhatsApp +{sender}"}, sender, "whatsapp")
+        if should_escalate:
+            if reply:
+                await wa_send(sender, reply)
+            await wa_send(
+                sender,
+                "👤 You're being connected to the wer2 GO support team. "
+                "Someone will contact you here as soon as possible. 🙏",
+            )
+            if SUPPORT_CHAT_ID:
+                await send_message(
+                    int(SUPPORT_CHAT_ID),
+                    f"🚨 <b>Support escalation (WhatsApp)</b>\n"
+                    f"From: +{sender}\n"
+                    f"Message: {text[:300]}",
+                )
+        elif reply:
+            await wa_send(sender, reply)
+
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
