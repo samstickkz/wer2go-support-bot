@@ -177,6 +177,35 @@ async def log_complaint(role: str, category: str, text: str, user, chat_id: int,
         log.error("Complaint sheet logging failed: %s", e)
 
 
+GROUP_CLASSIFY_PROMPT = """You watch a group chat for wer2 GO, a ride-hailing platform in Doha, Qatar.
+Decide whether a message is a complaint or problem report from a rider or a driver.
+Messages may be in any language.
+Reply with EXACTLY one line and nothing else:
+[COMPLAINT|<role>|<category>] if it is a complaint, where <role> is driver or rider and
+<category> is one of: cancellation, fare_payment, lost_item, driver_behaviour,
+rider_behaviour, payout_wallet, penalty, documents_verification, app_issue, other.
+Otherwise reply exactly: NONE"""
+
+
+async def classify_group_complaint(text: str) -> tuple[str, str] | None:
+    """Classify a group message; returns (role, category) if it's a complaint."""
+    if anthropic_client is None:
+        return None
+    try:
+        resp = await anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=30,
+            system=GROUP_CLASSIFY_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        out = resp.content[0].text.strip()
+    except Exception as e:
+        log.error("Group classification error: %s", e)
+        return None
+    _, complaint = parse_complaint_tag(out)
+    return complaint
+
+
 def parse_complaint_tag(reply: str) -> tuple[str, tuple[str, str] | None]:
     """Strip a leading [COMPLAINT|role|category] line; return (clean_reply, complaint)."""
     if not reply.startswith("[COMPLAINT|"):
@@ -295,8 +324,21 @@ async def webhook(secret: str, request: Request):
         await send_message(chat_id, f"Chat ID: <code>{chat_id}</code>")
         return {"ok": True}
 
-    # Ignore group chats (bot replies to customers in DMs only)
+    # Group chats: silently log complaints to the sheet (bot only replies in DMs)
     if msg["chat"]["type"] != "private":
+        if SUPPORT_CHAT_ID and str(chat_id) == str(SUPPORT_CHAT_ID):
+            return {"ok": True}  # never log the internal support team's own chatter
+        complaint = await classify_group_complaint(text)
+        if complaint:
+            role, category = complaint
+            group_title = msg["chat"].get("title", "group")
+            await log_complaint(role, category, text, user, chat_id, f"group:{group_title}")
+            # subtle ack so the user knows the complaint was captured
+            await tg("setMessageReaction", {
+                "chat_id": chat_id,
+                "message_id": msg["message_id"],
+                "reaction": [{"type": "emoji", "emoji": "👀"}],
+            })
         return {"ok": True}
 
     if text.startswith("/start"):
